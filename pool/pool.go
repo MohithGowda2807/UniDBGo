@@ -5,12 +5,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/unidb/unidb-go/circuit"
-	"github.com/unidb/unidb-go/internal"
+	"github.com/Dheeran-git/UniDBGo/circuit"
+	"github.com/Dheeran-git/UniDBGo/internal"
 )
 
 var ErrPoolExhausted = errors.New("connection pool exhausted")
 
+// ConnectionPool is a bounded pool of driver connections whose capacity is
+// resized by AutoTune. All fields are guarded by mu.
 type ConnectionPool struct {
 	mu          sync.Mutex
 	connections chan internal.Connection
@@ -18,6 +20,8 @@ type ConnectionPool struct {
 	active      int
 	exhausted   int
 	createConn  func() (internal.Connection, error)
+	stop        chan struct{}
+	stopOnce    sync.Once
 }
 
 func NewConnectionPool(maxSize int, create func() (internal.Connection, error)) *ConnectionPool {
@@ -25,8 +29,9 @@ func NewConnectionPool(maxSize int, create func() (internal.Connection, error)) 
 		connections: make(chan internal.Connection, maxSize),
 		maxSize:     maxSize,
 		createConn:  create,
+		stop:        make(chan struct{}),
 	}
-	go p.AutoTune()
+	go p.AutoTune(5 * time.Second)
 	return p
 }
 
@@ -51,48 +56,93 @@ func (p *ConnectionPool) Acquire() (internal.Connection, error) {
 	}
 }
 
+// Release returns a connection to the pool. If the pool shrank while the
+// connection was checked out and there is no room for it, it is closed.
 func (p *ConnectionPool) Release(conn internal.Connection) {
-	p.connections <- conn
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.active <= p.maxSize {
+		select {
+		case p.connections <- conn:
+			return
+		default:
+		}
+	}
+	p.active--
+	conn.Close()
 }
 
-// AutoTune continuously monitors and resizes the connection pool based on workload
-func (p *ConnectionPool) AutoTune() {
+// Stats reports the current capacity, open connections and idle connections.
+func (p *ConnectionPool) Stats() (maxSize, active, idle int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.maxSize, p.active, len(p.connections)
+}
+
+// Close stops the tuner and closes all idle connections.
+func (p *ConnectionPool) Close() {
+	p.stopOnce.Do(func() { close(p.stop) })
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	for {
-		time.Sleep(5 * time.Second)
-		p.mu.Lock()
-
-		exhaustedRate := p.exhausted
-		p.exhausted = 0 // reset window
-		idleCount := len(p.connections)
-
-		// Scale Up if we hit connection pool limits recently
-		if exhaustedRate > 5 {
-			p.maxSize += 5
-			newChan := make(chan internal.Connection, p.maxSize)
-			for i := 0; i < idleCount; i++ {
-				newChan <- <-p.connections
-			}
-			p.connections = newChan
-			
-		// Scale Down if we have too many idle connections sitting around
-		} else if idleCount > 10 && p.maxSize > 10 {
-			p.maxSize -= 2
-			newChan := make(chan internal.Connection, p.maxSize)
-
-			transferCount := idleCount
-			if transferCount > p.maxSize {
-				transferCount = p.maxSize
-			}
-
-			// Drop excess idle connections beyond new capacity
-			for i := 0; i < transferCount; i++ {
-				newChan <- <-p.connections
-			}
-			p.connections = newChan
+		select {
+		case c := <-p.connections:
+			p.active--
+			c.Close()
+		default:
+			return
 		}
-
-		p.mu.Unlock()
 	}
+}
+
+// AutoTune resizes the pool every interval: it grows by 5 when more than 5
+// acquisitions failed in the last window, and shrinks by 2 (never below 10)
+// when more than 10 connections sat idle.
+func (p *ConnectionPool) AutoTune(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.stop:
+			return
+		case <-ticker.C:
+		}
+		p.tuneOnce()
+	}
+}
+
+func (p *ConnectionPool) tuneOnce() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	exhaustedRate := p.exhausted
+	p.exhausted = 0 // reset window
+	idleCount := len(p.connections)
+
+	switch {
+	case exhaustedRate > 5:
+		p.resize(p.maxSize + 5)
+	case idleCount > 10 && p.maxSize > 10:
+		p.resize(p.maxSize - 2)
+	}
+}
+
+// resize swaps in a channel of the new capacity, closing idle connections
+// that no longer fit. Caller holds mu.
+func (p *ConnectionPool) resize(newSize int) {
+	newChan := make(chan internal.Connection, newSize)
+	for len(p.connections) > 0 {
+		c := <-p.connections
+		if len(newChan) < newSize {
+			newChan <- c
+		} else {
+			p.active--
+			c.Close()
+		}
+	}
+	p.connections = newChan
+	p.maxSize = newSize
 }
 
 type PoolManager struct {

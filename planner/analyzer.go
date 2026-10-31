@@ -1,6 +1,6 @@
 package planner
 
-import "github.com/unidb/unidb-go/parser"
+import "github.com/Dheeran-git/UniDBGo/parser"
 
 // Analyze inspects AST to determine query characteristics
 func Analyze(ast *parser.QueryAST) QueryMetadata {

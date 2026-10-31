@@ -2,7 +2,7 @@ package api
 
 import (
 	"context"
-	"github.com/unidb/unidb-go/internal"
+	"github.com/Dheeran-git/UniDBGo/internal"
 )
 
 // Handler processes a query and returns a result.

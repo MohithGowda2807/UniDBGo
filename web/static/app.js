@@ -221,9 +221,9 @@ document.addEventListener('DOMContentLoaded', () => {
             const dbDiv = document.createElement('div');
             dbDiv.className = 'schema-db';
             dbDiv.innerHTML = `
-                <span class="db-name">${db}</span>
+                <span class="db-name">${esc(db)}</span>
                 <ul class="table-list">
-                    ${tables.map(t => `<li class="table-item" data-db="${db}" data-table="${t.name}">${t.name}</li>`).join('')}
+                    ${tables.map(t => `<li class="table-item" data-db="${esc(db)}" data-table="${esc(t.name)}">${esc(t.name)}</li>`).join('')}
                 </ul>
             `;
             explorerSchemaList.appendChild(dbDiv);
@@ -244,16 +244,16 @@ document.addEventListener('DOMContentLoaded', () => {
     function showTableDetails(db, tableName) {
         const table = schemas[db].find(t => t.name === tableName);
         explorerDetails.innerHTML = `
-            <h3 style="margin-bottom: 1rem; color: var(--accent);">${db.toUpperCase()}.${tableName}</h3>
+            <h3 style="margin-bottom: 1rem; color: var(--accent);">${esc(db.toUpperCase())}.${esc(tableName)}</h3>
             <table style="font-size: 0.9rem;">
                 <thead><tr><th>Column Name</th><th>Type (Inferred)</th></tr></thead>
                 <tbody>
-                    ${table.columns.map(c => `<tr><td>${c}</td><td>${inferType(c)}</td></tr>`).join('')}
+                    ${table.columns.map(c => `<tr><td>${esc(c)}</td><td>${inferType(c)}</td></tr>`).join('')}
                 </tbody>
             </table>
             <div style="margin-top: 2rem;">
                 <h4 style="margin-bottom: 0.5rem; opacity: 0.7;">Sample Data</h4>
-                <p style="font-size: 0.8rem; color: var(--text-muted);">Fetching live samples from ${db} instance...</p>
+                <p style="font-size: 0.8rem; color: var(--text-muted);">Fetching live samples from ${esc(db)} instance...</p>
             </div>
         `;
     }
@@ -266,6 +266,14 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // --- HELPERS ---
+    // esc makes any value safe to interpolate into HTML; query text, plan
+    // steps and result rows can all contain attacker-controlled strings.
+    function esc(v) {
+        return String(v ?? '').replace(/[&<>"']/g, ch => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        })[ch]);
+    }
+
     function updateSecurityUI(dec, statusId, reasonId) {
         const statusEl = document.getElementById(statusId);
         const reasonEl = document.getElementById(reasonId);
@@ -288,12 +296,12 @@ document.addEventListener('DOMContentLoaded', () => {
             const card = document.createElement('div');
             card.className = 'plan-card';
             card.innerHTML = `
-                <div class="step-id">${step.ID}</div>
+                <div class="step-id">${esc(step.ID)}</div>
                 <div class="step-details">
-                    <div class="step-type">${step.Type}</div>
+                    <div class="step-type">${esc(step.Type)}</div>
                     <div class="step-meta">
-                        <span class="step-db">${step.Database || 'FEDERATOR'}</span>
-                        <div style="font-size: 0.7rem; margin-top: 4px;"><code>${step.Query || ''}</code></div>
+                        <span class="step-db">${esc(step.Database || 'FEDERATOR')}</span>
+                        <div style="font-size: 0.7rem; margin-top: 4px;"><code>${esc(step.Query || '')}</code></div>
                     </div>
                 </div>
             `;
@@ -315,8 +323,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
         empty.classList.add('hidden');
         table.classList.remove('hidden');
-        thead.innerHTML = Object.keys(rows[0]).map(c => `<th>${c}</th>`).join('');
-        tbody.innerHTML = rows.map(row => `<tr>${Object.values(row).map(v => `<td>${v}</td>`).join('')}</tr>`).join('');
+        // Use one column order for every row, even if rows differ in key order.
+        const cols = Object.keys(rows[0]);
+        thead.innerHTML = cols.map(c => `<th>${esc(c)}</th>`).join('');
+        tbody.innerHTML = rows.map(row => `<tr>${cols.map(c => `<td>${esc(row[c])}</td>`).join('')}</tr>`).join('');
     }
 
     function updateMetrics(metrics) {
@@ -334,10 +344,12 @@ document.addEventListener('DOMContentLoaded', () => {
         const grid = document.getElementById('metrics-stats-grid');
         grid.innerHTML = '';
         for (const [db, stats] of Object.entries(data)) {
-            const percent = (stats.active / stats.max) * 100;
+            // max is 0 when the pool has no open-connection limit.
+            const percent = stats.max > 0 ? (stats.active / stats.max) * 100 : 0;
+            const max = stats.max > 0 ? stats.max : '∞';
             grid.innerHTML += `
                 <div class="stat-card">
-                    <div class="stat-header"><span>${db.toUpperCase()}</span><span>${stats.active}/${stats.max}</span></div>
+                    <div class="stat-header"><span>${esc(db.toUpperCase())}</span><span>${esc(stats.active)}/${esc(max)}</span></div>
                     <div class="gauge-bar"><div class="gauge-fill" style="width:${percent}%; background:${percent > 80 ? '#ef4444' : '#3b82f6'}"></div></div>
                 </div>
             `;
@@ -388,11 +400,11 @@ document.addEventListener('DOMContentLoaded', () => {
         output.className = 'demo-live-output';
         output.innerHTML = `
             <div class="demo-output-header">
-                <span class="demo-output-title">${timeLabel}</span>
-                <span class="demo-output-time">${timeMs}</span>
+                <span class="demo-output-title">${esc(timeLabel)}</span>
+                <span class="demo-output-time">${esc(timeMs)}</span>
             </div>
             <div class="demo-output-body">
-                ${lines.map(l => `<div class="${l.cls}">${l.text}</div>`).join('')}
+                ${lines.map(l => `<div class="${esc(l.cls)}">${esc(l.text)}</div>`).join('')}
             </div>
         `;
         container.appendChild(output);
@@ -506,7 +518,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 { q: "SELECT id FROM users WHERE id = 1", expected: 'safe', label: 'Normal query' },
                 { q: "SELECT * FROM users WHERE id = 1 OR 1=1", expected: 'blocked', label: 'SQL Injection (OR 1=1)' },
                 { q: "SELECT * FROM users WHERE id = 1; DROP TABLE users--", expected: 'blocked', label: 'SQL Injection (comment)' },
-                { q: "SELECT * FROM users WHERE id = SLEEP(5)", expected: 'blocked', label: 'Time-based attack (AI)' },
+                { q: "SELECT * FROM users WHERE id = SLEEP(5)", expected: 'blocked', label: 'Time-based attack (V5)' },
                 { q: "SELECT * FROM users", expected: 'flagged', label: 'Data exfiltration risk' },
             ];
 
@@ -577,7 +589,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
                 lines.push({ text: '', cls: '' });
                 lines.push({ text: '✗ Standard Go: manual nested for-loops (O(n²))', cls: 'line-fail' });
-                lines.push({ text: '✓ UniDB: automatic hash join (O(n))', cls: 'line-pass' });
+                lines.push({ text: '✓ UniDB: automatic hash join (O(n+m))', cls: 'line-pass' });
             }
 
             // Simulated time comparison: standard Go manual join vs UniDB
@@ -587,24 +599,24 @@ document.addEventListener('DOMContentLoaded', () => {
             markDemoComplete(4);
         },
 
-        // Demo 5: AI Router
+        // Demo 5: Naive Bayes dialect router
         5: async function() {
             const testQueries = [
-                { q: "SELECT * FROM users WHERE ROWNUM <= 10", expectDb: "oracle", label: "ROWNUM → Oracle" },
+                { q: "SELECT * FROM users WHERE id = $1", expectDb: "postgres", label: "$1 placeholder → PostgreSQL" },
                 { q: "SELECT JSON_EXTRACT(data, '$.name') FROM configs", expectDb: "mysql", label: "JSON_EXTRACT → MySQL" },
                 { q: '{ "find": "users", "filter": { "age": { "$gt": 25 } } }', expectDb: "mongodb", label: "MQL format → MongoDB" },
                 { q: "SELECT data->>'name' FROM configs", expectDb: "postgres", label: "JSONB (->>) → PostgreSQL" },
-                { q: "SELECT * FROM users ORDER BY id DESC LIMIT 5", expectDb: "mysql", label: "LIMIT pattern → MySQL" },
+                { q: "SELECT * FROM `users` WHERE id = ?", expectDb: "mysql", label: "Back-quotes and ? → MySQL" },
             ];
 
             const lines = [
-                { text: '── AI Query Router (Naive Bayes) Test ──', cls: 'line-info' },
+                { text: '── Dialect Router (Naive Bayes) Test ──', cls: 'line-info' },
                 { text: '', cls: '' },
-                { text: 'Training model on 6 seed records...', cls: '' },
+                { text: 'Training model on seed records...', cls: '' },
             ];
 
             const start = performance.now();
-            // Fetch the AI router demo endpoint
+            // Fetch the router demo endpoint
             const res = await fetch('/api/demo/ai-router', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -630,7 +642,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 lines.push({ text: '', cls: '' });
                 lines.push({ text: '✗ Standard Go: developer must hardcode DB choice', cls: 'line-fail' });
-                renderDemoOutput(5, lines, 'AI Router', `${elapsed.toFixed(1)}ms`);
+                renderDemoOutput(5, lines, 'Dialect Router', `${elapsed.toFixed(1)}ms`);
             } else {
                 // Fallback: show simulated results if endpoint not available
                 lines.push({ text: '', cls: '' });
@@ -640,7 +652,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 });
                 lines.push({ text: '', cls: '' });
                 lines.push({ text: '✗ Standard Go: no ML-based routing exists', cls: 'line-fail' });
-                renderDemoOutput(5, lines, 'AI Router (Demo)', '✓ Model trained');
+                renderDemoOutput(5, lines, 'Dialect Router (Demo)', '✓ Model trained');
             }
             markDemoComplete(5);
         },
@@ -702,9 +714,11 @@ document.addEventListener('DOMContentLoaded', () => {
             ];
 
             for (const [db, s] of Object.entries(stats)) {
-                const usage = ((s.active / s.max) * 100).toFixed(0);
+                // max is 0 when the pool has no open-connection limit.
+                const usage = s.max > 0 ? ((s.active / s.max) * 100).toFixed(0) : 0;
+                const max = s.max > 0 ? `${s.max} (${usage}% utilization)` : 'unlimited';
                 lines.push({ text: `${db.toUpperCase()}:`, cls: 'line-info' });
-                lines.push({ text: `  Active: ${s.active} | Idle: ${s.idle} | Max: ${s.max} (${usage}% utilization)`, cls: '' });
+                lines.push({ text: `  Active: ${s.active} | Idle: ${s.idle} | Max: ${max}`, cls: '' });
                 if (usage > 80) {
                     lines.push({ text: `  ⚠️ AutoTune: would SCALE UP (+5 connections)`, cls: 'line-warn' });
                 } else if (s.idle > 10) {

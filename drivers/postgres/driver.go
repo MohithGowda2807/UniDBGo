@@ -1,12 +1,16 @@
+// Package postgres registers the PostgreSQL driver (lib/pq).
 package postgres
 
 import (
 	"database/sql"
-	"fmt"
+	"errors"
+	"net"
+	"net/url"
+	"strconv"
 
-	_ "github.com/lib/pq"
-	"github.com/unidb/unidb-go/drivers/sqlwrap"
-	"github.com/unidb/unidb-go/internal"
+	"github.com/Dheeran-git/UniDBGo/drivers/sqlwrap"
+	"github.com/Dheeran-git/UniDBGo/internal"
+	"github.com/lib/pq"
 )
 
 func init() {
@@ -15,24 +19,53 @@ func init() {
 
 type PostgresDriver struct{}
 
-func (d *PostgresDriver) Connect(config internal.Config) (internal.Connection, error) {
-	// postgres://user:pass@localhost:5432/dbname?sslmode=disable
-	connStr := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable",
-		config.Username, config.Password, config.Host, config.Port, config.Database)
+// DSN renders config as a lib/pq connection URI. URI parameters are passed
+// through; sslmode defaults to "disable" when not given.
+func DSN(config internal.Config) string {
+	q := url.Values{}
+	for k, v := range config.Params {
+		q.Set(k, v)
+	}
+	if q.Get("sslmode") == "" {
+		q.Set("sslmode", "disable")
+	}
+	u := url.URL{
+		Scheme:   "postgres",
+		Host:     net.JoinHostPort(config.Host, strconv.Itoa(config.Port)),
+		Path:     "/" + config.Database,
+		RawQuery: q.Encode(),
+	}
+	if config.Username != "" {
+		u.User = url.UserPassword(config.Username, config.Password)
+	}
+	return u.String()
+}
 
-	db, err := sql.Open("postgres", connStr)
+func (d *PostgresDriver) Connect(config internal.Config) (internal.Connection, error) {
+	db, err := sql.Open("postgres", DSN(config))
 	if err != nil {
 		return nil, err
 	}
+	return sqlwrap.Open(db, classify, config.PoolSize)
+}
 
-	if config.PoolSize > 0 {
-		db.SetMaxOpenConns(config.PoolSize)
+// classify maps PostgreSQL SQLSTATE codes to portable errors.
+func classify(err error) error {
+	var pgErr *pq.Error
+	if !errors.As(err, &pgErr) {
+		return nil
 	}
-
-	// Ping to verify connection
-	// err = db.Ping() // Skip ping for mocking without real db
-
-	return &sqlwrap.SQLConnection{DB: db}, nil
+	switch pgErr.Code {
+	case "23505":
+		return internal.ErrUniqueViolation
+	case "23503":
+		return internal.ErrForeignKeyViolation
+	case "23502":
+		return internal.ErrNotNullViolation
+	case "40001", "40P01":
+		return internal.ErrDeadlock
+	}
+	return nil
 }
 
 func (d *PostgresDriver) Capabilities() internal.Capabilities {
@@ -43,3 +76,7 @@ func (d *PostgresDriver) Capabilities() internal.Capabilities {
 		SupportsAggregation:  true,
 	}
 }
+
+// WrapError adds the portable error value (api.ErrUniqueViolation, ...) to a
+// lib/pq error; the driver applies it to every error it returns.
+func WrapError(err error) error { return internal.Classify(classify, err) }

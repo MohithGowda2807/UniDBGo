@@ -1,41 +1,13 @@
 package parser
 
 import (
-	"github.com/xwb1989/sqlparser"
+	"vitess.io/vitess/go/vt/sqlparser"
 )
 
-func parseDDL(ddl *sqlparser.DDL) (*QueryAST, error) {
-	// For basic passing through DDL support
-	ast := &QueryAST{
-		Type: "DDL",
+func parseDDL(ddl sqlparser.DDLStatement) (*QueryAST, error) {
+	ast := &QueryAST{Type: "DDL"}
+	for _, t := range ddl.AffectedTables() {
+		addTableName(t, "", ast)
 	}
-	
-	if ddl.Table.Name.String() != "" {
-		ast.Tables = []TableNode{
-			{Name: ddl.Table.Name.String()},
-		}
-	} else if ddl.Action == "create" {
-		// Possibly CREATE DATABASE, just pass the syntax
-		// The AST itself doesn't need to parse down everything for MVP routing
-	}
-	
 	return ast, nil
-}
-
-func parseDBDDL(ddldb *sqlparser.DBDDL) (*QueryAST, error) {
-	return &QueryAST{
-		Type: "DDL",
-	}, nil
-}
-
-func parseShow(show *sqlparser.Show) (*QueryAST, error) {
-	return &QueryAST{
-		Type: "META",
-	}, nil
-}
-
-func parseUse(use *sqlparser.Use) (*QueryAST, error) {
-	return &QueryAST{
-		Type: "META",
-	}, nil
 }

@@ -1,0 +1,27 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/bin/
+/unidb-web
+/unidb-bench
+
+# Test and coverage output
+*.test
+*.out
+coverage.*
+
+# Router training store created at runtime
+*.db.json
+
+# Editors and OS files
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Benchmark output written by cmd/unidb-bench
+/bench/results/

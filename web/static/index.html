@@ -358,7 +358,7 @@ query := "SELECT u.name FROM users u"
                                 <span class="demo-tag tag-critical">CRITICAL GAP</span>
                             </div>
                         </div>
-                        <p class="demo-card-desc">Standard Go only has parameterized queries. UniDB adds rule-based detection, AI scoring, exfiltration detection, and anomaly analysis.</p>
+                        <p class="demo-card-desc">Standard Go only has parameterized queries. UniDB inspects the syntax tree of every query: tautologies, stacked statements, UNION extraction, comment truncation and timing functions.</p>
                         <div class="demo-comparison">
                             <div class="demo-col demo-col-old">
                                 <div class="demo-col-label">❌ Standard Go</div>
@@ -368,17 +368,17 @@ db.Query("SELECT * FROM users WHERE id=$1", id)
 // But if developer writes:
 db.Query("SELECT * FROM users WHERE id=" + id)
 // → SQL INJECTION! No warning!
-// No detection. No AI. No protection.
+// No detection. No protection.
 // No exfiltration alerts.</code></pre>
                             </div>
                             <div class="demo-col demo-col-new">
                                 <div class="demo-col-label">✅ UniDB-Go</div>
                                 <pre><code class="language-go">db.Use(security.SecurityMiddleware(engine))
 
-// Layer 1: Rule-based (OR 1=1, UNION)
-// Layer 2: AI scoring (SLEEP, BENCHMARK)
-// Layer 3: Exfiltration (sensitive tables)
-// Layer 4: Anomaly (oversized queries)
+// V1: tautologies   (OR 1=1, OR 0x41=0x41)
+// V2: piggy-backing (; DROP TABLE ...)
+// V3: exfiltration  (UNION, restricted tables)
+// + comment truncation, SLEEP()/BENCHMARK()
 
 // Auto-blocks attacks, flags suspicious
 // queries — ZERO developer effort!</code></pre>
@@ -427,7 +427,7 @@ db.Query(ctx, `
 `)
 // → Step 1: Parallel SCAN postgres
 // → Step 2: Parallel SCAN mysql
-// → Step 3: Hash Join in-memory (O(n))</code></pre>
+// → Step 3: Hash Join in-memory (O(n+m))</code></pre>
                             </div>
                         </div>
                         <div class="demo-result" id="demo-result-4">
@@ -435,14 +435,14 @@ db.Query(ctx, `
                         </div>
                     </div>
 
-                    <!-- DEMO 5: AI Router -->
+                    <!-- DEMO 5: Dialect Router -->
                     <div class="demo-card" id="demo-card-5">
                         <div class="demo-card-badge">05</div>
                         <div class="demo-card-header">
                             <div class="demo-card-icon">🤖</div>
                             <div>
-                                <h3>AI-Powered Query Router</h3>
-                                <span class="demo-tag tag-ai">AI / ML</span>
+                                <h3>Probabilistic Dialect Router</h3>
+                                <span class="demo-tag tag-ai">Naive Bayes</span>
                             </div>
                         </div>
                         <p class="demo-card-desc">Go's database/sql has zero query intelligence. UniDB uses a Naive Bayes classifier to predict the optimal database & dialect for any query.</p>
@@ -450,20 +450,20 @@ db.Query(ctx, `
                             <div class="demo-col demo-col-old">
                                 <div class="demo-col-label">❌ Standard Go</div>
                                 <pre><code class="language-go">// Developer must know which DB to use
-if isOracle {
-  oracleDB.Query("...WHERE ROWNUM <= 10")
+if isMySQL {
+  myDB.Query("...WHERE id = ?")
 } else if isMongo {
   collection.Find(bson.M{...})
 } else {
-  pgDB.Query("...LIMIT 10")
+  pgDB.Query("...WHERE id = $1")
 }
 // Manual, error-prone, no intelligence</code></pre>
                             </div>
                             <div class="demo-col demo-col-new">
                                 <div class="demo-col-label">✅ UniDB-Go</div>
-                                <pre><code class="language-go">// Naive Bayes ML model auto-detects:
-model.Predict("...WHERE ROWNUM <= 10")
-// → {DB: oracle, Dialect: OracleSQL}
+                                <pre><code class="language-go">// Naive Bayes model detects the dialect:
+model.Predict("...WHERE id = $1")
+// → {DB: postgres, Dialect: PostgreSQL}
 
 model.Predict("...JSON_EXTRACT(data)")
 // → {DB: mysql, Dialect: MySQL}

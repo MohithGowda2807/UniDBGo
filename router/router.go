@@ -1,7 +1,7 @@
 package router
 
 import (
-	"github.com/unidb/unidb-go/planner"
+	"github.com/Dheeran-git/UniDBGo/planner"
 )
 
 // Route maps a step to a specific database and SQL dialect
@@ -9,6 +9,7 @@ type Route struct {
 	StepID         int
 	Database       string
 	CommandDialect string
+	Confidence     float64
 }
 
 type Router interface {
@@ -26,6 +27,7 @@ func (r *DefaultRouter) Route(plan *planner.ExecutionPlan) ([]Route, error) {
 				StepID:         step.ID,
 				Database:       step.Database,
 				CommandDialect: "SQL", // Default fallback
+				Confidence:     1,
 			})
 		}
 	}

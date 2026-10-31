@@ -1,8 +1,10 @@
 package parser
 
+import "vitess.io/vitess/go/vt/sqlparser"
+
 // QueryAST represents the normalized internal AST
 type QueryAST struct {
-	Type              string // SELECT, INSERT, UPDATE, DELETE
+	Type              string // SELECT, INSERT, UPDATE, DELETE, UNION, DDL, META
 	RawQuery          string
 	Tables            []TableNode
 	Fields            []FieldNode
@@ -10,6 +12,11 @@ type QueryAST struct {
 	Joins             []JoinNode
 	Limit             *int
 	IsNoSQLCompatible bool
+	// Dialect records the lexical rules the query was read with.
+	Dialect Dialect
+
+	// Stmt is the full Vitess syntax tree the summary above was derived from.
+	Stmt sqlparser.Statement `json:"-"`
 }
 
 type TableNode struct {

@@ -2,6 +2,8 @@ package router
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"sync"
 )
@@ -26,7 +28,10 @@ func NewCommonDB(filePath string) (*CommonDB, error) {
 		filePath: filePath,
 		records:  []TrainingRecord{},
 	}
-	_ = db.Load() // Ignore error on first load if it doesn't exist
+	// A missing file is a fresh store; an unreadable or corrupt one is an error.
+	if err := db.Load(); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("router: loading training store %s: %w", filePath, err)
+	}
 	return db, nil
 }
 
@@ -34,7 +39,7 @@ func NewCommonDB(filePath string) (*CommonDB, error) {
 func (db *CommonDB) AddRecord(record TrainingRecord) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	
+
 	db.records = append(db.records, record)
 	return db.save()
 }
@@ -43,7 +48,7 @@ func (db *CommonDB) AddRecord(record TrainingRecord) error {
 func (db *CommonDB) GetAllRecords() []TrainingRecord {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	
+
 	// Return a copy to avoid external mutation
 	copied := make([]TrainingRecord, len(db.records))
 	copy(copied, db.records)
@@ -54,12 +59,12 @@ func (db *CommonDB) GetAllRecords() []TrainingRecord {
 func (db *CommonDB) Load() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	
+
 	data, err := os.ReadFile(db.filePath)
 	if err != nil {
 		return err
 	}
-	
+
 	return json.Unmarshal(data, &db.records)
 }
 
@@ -69,6 +74,6 @@ func (db *CommonDB) save() error {
 	if err != nil {
 		return err
 	}
-	
+
 	return os.WriteFile(db.filePath, data, 0644)
 }
