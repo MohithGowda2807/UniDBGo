@@ -7,6 +7,8 @@
 //	unidb-bench setup  -pg DSN -my DSN   # load the e-commerce dataset
 //	unidb-bench latency -pg DSN -my DSN  # native driver vs UniDB-Go latency
 //	unidb-bench throughput -pg DSN       # QPS under concurrent workers
+//	unidb-bench -reps 10 latencyci       # latency over independent repetitions, with CIs
+//	unidb-bench -reps 10 throughputci    # throughput over independent repetitions, with CIs
 package main
 
 import (
@@ -17,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 var (
@@ -31,8 +34,12 @@ var (
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: unidb-bench [flags] security|router|join|setup|latency|throughput|fedscale")
-		flag.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "usage: unidb-bench [flags] security|router|join|setup|latency|throughput|fedscale|latencyci|throughputci|mixed")
+		flag.VisitAll(func(f *flag.Flag) {
+			if !strings.HasPrefix(f.Name, "child-") { // internal re-exec flags stay hidden
+				fmt.Fprintf(os.Stderr, "  -%s\n    \t%s (default %q)\n", f.Name, f.Usage, f.DefValue)
+			}
+		})
 	}
 	flag.Parse()
 	if flag.NArg() != 1 {
@@ -60,6 +67,12 @@ func main() {
 		err = runThroughput()
 	case "fedscale":
 		err = runFedScale()
+	case "latencyci":
+		err = runLatencyCI()
+	case "throughputci":
+		err = runThroughputCI()
+	case "mixed":
+		err = runMixed()
 	default:
 		flag.Usage()
 		os.Exit(2)

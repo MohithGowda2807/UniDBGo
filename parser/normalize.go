@@ -43,6 +43,7 @@ func NormalizeDialect(query string) string { return Normalize(query, MySQL) }
 //	"Name"       ->  `Name`         (double quotes delimit identifiers)
 //	$$text$$     ->  'text'         (dollar-quoted strings)
 //	a # b        ->  a ^ b          (# is XOR, not a comment)
+//	a || b       ->  a + b          (concatenation, not OR)
 //
 // E'...' strings keep backslash escapes, as in PostgreSQL.
 func Normalize(query string, d Dialect) string {
@@ -84,12 +85,35 @@ func Normalize(query string, d Dialect) string {
 		case c == '#' && pg:
 			b.WriteByte('^')
 			i++
+		case c == '|' && pg && i+1 < n && query[i+1] == '|':
+			// PostgreSQL concatenation, which MySQL reads as OR. Arithmetic
+			// '+' has the same place in the precedence order, so the tree
+			// keeps PostgreSQL's structure.
+			b.WriteString(" + ")
+			i += 2
 		case pg && (c == 'E' || c == 'e') && i+1 < n && query[i+1] == '\'' && (i == 0 || !isIdent(query[i-1])):
 			i++ // E'...' keeps backslash escapes, which MySQL also uses; drop the prefix
 		case c == '\'' || c == '"' || c == '`':
 			j := skipQuoted(query, i)
 			b.WriteString(query[i:j])
 			i = j
+		case pg && c == '-' && i+1 < n && query[i+1] == '-':
+			// PostgreSQL starts a comment at any "--"; MySQL, and the
+			// tokenizer, only when whitespace follows.
+			j := strings.IndexByte(query[i:], '\n')
+			if j < 0 {
+				j = n - i
+			}
+			b.WriteString("-- ")
+			b.WriteString(query[i+2 : i+j])
+			i += j
+		case pg && c == '/' && i+1 < n && query[i+1] == '*':
+			// PostgreSQL block comments nest; MySQL's end at the first "*/".
+			end := nestedCommentEnd(query, i)
+			b.WriteString("/* ")
+			b.WriteString(strings.NewReplacer("*/", "* /", "/*", "/ *").Replace(query[i+2 : max(i+2, end-2)]))
+			b.WriteString(" */")
+			i = end
 		case c == '-' && i+1 < n && query[i+1] == '-', c == '#':
 			j := strings.IndexByte(query[i:], '\n')
 			if j < 0 {
@@ -147,7 +171,7 @@ func needsNormalization(q string, d Dialect) bool {
 		switch q[i] {
 		case '$', ':':
 			return true
-		case '\\', '"', '#':
+		case '\\', '"', '#', '|', '-', '/':
 			if d == Postgres {
 				return true
 			}
@@ -158,6 +182,26 @@ func needsNormalization(q string, d Dialect) bool {
 		}
 	}
 	return false
+}
+
+// nestedCommentEnd returns the index just past the PostgreSQL block comment
+// starting at i, honouring nesting, or len(s) if it is not closed.
+func nestedCommentEnd(s string, i int) int {
+	depth := 0
+	for j := i; j+1 < len(s); j++ {
+		switch {
+		case s[j] == '/' && s[j+1] == '*':
+			depth++
+			j++
+		case s[j] == '*' && s[j+1] == '/':
+			depth--
+			j++
+			if depth == 0 {
+				return j + 1
+			}
+		}
+	}
+	return len(s)
 }
 
 // skipQuoted returns the index just past the quoted section starting at i,
@@ -365,14 +409,31 @@ func Bind(sql string, d Dialect) string {
 }
 
 // DialectSensitive reports whether query contains anything that PostgreSQL
-// and MySQL read differently: backslashes, double quotes, '#', E” or
-// dollar-quoted strings. It allocates nothing, so callers can skip a second,
+// and MySQL read differently: backslashes, double quotes, '#', '||', '--'
+// without a following space, nested block comments, E” or dollar-quoted
+// strings. It allocates nothing, so callers can skip a second,
 // dialect-specific parse for the common case.
 func DialectSensitive(query string) bool {
 	for i := 0; i < len(query); i++ {
 		switch query[i] {
 		case '\\', '"', '#':
 			return true
+		case '|':
+			if i+1 < len(query) && query[i+1] == '|' {
+				return true // concatenation in PostgreSQL, OR in MySQL
+			}
+		case '-':
+			// "--x" starts a comment in PostgreSQL but not in MySQL.
+			if i+2 < len(query) && query[i+1] == '-' && !unicode.IsSpace(rune(query[i+2])) {
+				return true
+			}
+		case '/':
+			// A nested "/*" ends the comment later in PostgreSQL than in MySQL.
+			if i+1 < len(query) && query[i+1] == '*' {
+				if end := strings.Index(query[i+2:], "*/"); end >= 0 && strings.Contains(query[i+2:i+2+end], "/*") {
+					return true
+				}
+			}
 		case '$':
 			if dollarTagAt(query, i) != "" {
 				return true

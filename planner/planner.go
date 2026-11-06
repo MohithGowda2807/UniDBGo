@@ -13,7 +13,9 @@ func GeneratePlan(ast *parser.QueryAST) (*ExecutionPlan, error) {
 	// Single DB plan: the whole statement is sent to one backend. A database
 	// qualifier such as "mysql.orders" names the backend, not a schema, so it
 	// is removed from the text; nothing else is rewritten, so literals and
-	// dialect-specific syntax reach the backend exactly as written.
+	// dialect-specific syntax reach the backend exactly as written. The text
+	// is never re-rendered from ast.Stmt, which for INTERSECT / EXCEPT is a
+	// synthetic UNION chain (see parser.QueryAST.SetOps).
 	db := "default"
 	queryStr := ast.RawQuery
 	if len(ast.Tables) > 0 && ast.Tables[0].Database != "" {

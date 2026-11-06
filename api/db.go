@@ -26,7 +26,45 @@ func (db *DB) chain(final Handler) Handler {
 
 // Query executes a query that returns rows, typically a SELECT.
 func (db *DB) Query(ctx context.Context, query string, args ...any) (internal.Result, error) {
-	return db.chain(db.conn.Query)(db.withDriver(ctx), query, args...)
+	h := db.chain(db.conn.Query)
+	return bounded(ctx, func() (internal.Result, error) { return h(db.withDriver(ctx), query, args...) },
+		func(r internal.Result) {
+			if r != nil {
+				r.Close()
+			}
+		})
+}
+
+// bounded runs call and returns no later than the end of ctx. Some drivers do
+// not return when their context ends (lib/pq blocks on a server that stops
+// answering); the caller then gets ctx.Err() at the deadline, and a result
+// that arrives later is released with discard. Contexts that can never end
+// run call directly, with no extra goroutine.
+func bounded[T any](ctx context.Context, call func() (T, error), discard func(T)) (T, error) {
+	if ctx.Done() == nil {
+		return call()
+	}
+	type outcome struct {
+		v   T
+		err error
+	}
+	ch := make(chan outcome, 1)
+	go func() {
+		v, err := call()
+		ch <- outcome{v, err}
+	}()
+	select {
+	case o := <-ch:
+		return o.v, o.err
+	case <-ctx.Done():
+		go func() {
+			if o := <-ch; o.err == nil {
+				discard(o.v)
+			}
+		}()
+		var zero T
+		return zero, ctx.Err()
+	}
 }
 
 // withDriver tells middleware which driver, and so which SQL dialect, runs the query.
@@ -38,7 +76,9 @@ func (db *DB) withDriver(ctx context.Context) context.Context {
 // UPDATE, or DELETE. It passes through the same middleware chain as Query, so
 // security and metrics middleware also see write statements.
 func (db *DB) Exec(ctx context.Context, query string, args ...any) (internal.ExecResult, error) {
-	return execThrough(db.chain, db.conn.Exec, db.withDriver(ctx), query, args...)
+	return bounded(ctx, func() (internal.ExecResult, error) {
+		return execThrough(db.chain, db.conn.Exec, db.withDriver(ctx), query, args...)
+	}, func(internal.ExecResult) {})
 }
 
 // execThrough runs exec at the end of a Query-shaped middleware chain.
@@ -63,7 +103,12 @@ type TxOptions = internal.TxOptions
 // BeginTx starts a database transaction; opts may be nil. Statements issued
 // on the returned transaction pass through the middleware chain.
 func (db *DB) BeginTx(ctx context.Context, opts *TxOptions) (internal.Tx, error) {
-	tx, err := db.conn.BeginTx(ctx, opts)
+	tx, err := bounded(ctx, func() (internal.Tx, error) { return db.conn.BeginTx(ctx, opts) },
+		func(tx internal.Tx) {
+			if tx != nil {
+				tx.Rollback()
+			}
+		})
 	if err != nil {
 		return nil, err
 	}
@@ -89,12 +134,22 @@ type chainedTx struct {
 	db *DB
 }
 
+// Statements in a transaction are bounded by their context like DB.Query and
+// DB.Exec. Commit and Rollback take no context and are not bounded.
 func (t *chainedTx) Query(ctx context.Context, query string, args ...any) (internal.Result, error) {
-	return t.db.chain(t.tx.Query)(t.db.withDriver(ctx), query, args...)
+	h := t.db.chain(t.tx.Query)
+	return bounded(ctx, func() (internal.Result, error) { return h(t.db.withDriver(ctx), query, args...) },
+		func(r internal.Result) {
+			if r != nil {
+				r.Close()
+			}
+		})
 }
 
 func (t *chainedTx) Exec(ctx context.Context, query string, args ...any) (internal.ExecResult, error) {
-	return execThrough(t.db.chain, t.tx.Exec, t.db.withDriver(ctx), query, args...)
+	return bounded(ctx, func() (internal.ExecResult, error) {
+		return execThrough(t.db.chain, t.tx.Exec, t.db.withDriver(ctx), query, args...)
+	}, func(internal.ExecResult) {})
 }
 
 func (t *chainedTx) Commit() error   { return t.tx.Commit() }

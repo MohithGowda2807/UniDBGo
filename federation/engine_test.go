@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/Dheeran-git/UniDBGo/internal"
 	"github.com/Dheeran-git/UniDBGo/parser"
@@ -125,5 +126,41 @@ func TestProjectionCaseAndAlias(t *testing.T) {
 	}
 	if cols := res.Columns(); len(cols) != 1 || cols[0] != "customer" {
 		t.Fatalf("columns %v, want [customer]", cols)
+	}
+}
+
+// hangConn is a source whose driver ignores its context, as lib/pq does when
+// the server stops answering.
+type hangConn struct {
+	fakeConn
+	release chan struct{}
+}
+
+func (c *hangConn) Query(context.Context, string, ...any) (internal.Result, error) {
+	<-c.release
+	return &fakeResult{i: -1}, nil
+}
+
+func TestExecuteReturnsAtCallerDeadline(t *testing.T) {
+	pg := &hangConn{fakeConn: fakeConn{driver: "postgres"}, release: make(chan struct{})}
+	defer close(pg.release)
+	my := &fakeConn{driver: "mysql", cols: []string{"user_id", "total"}, rows: [][]any{{[]byte("1"), []byte("1")}}}
+	ast, err := parser.Parse("SELECT u.name, o.total FROM postgres.users u JOIN mysql.orders o ON u.id = o.user_id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := planner.GeneratePlan(ast)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = NewEngine(map[string]internal.Connection{"postgres": pg, "mysql": my}).Execute(ctx, plan)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want deadline exceeded", err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("returned after %v", d)
 	}
 }

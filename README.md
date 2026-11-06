@@ -102,7 +102,12 @@ go run ./cmd/unidb-bench setup        # load 50,000 users (PostgreSQL) and order
 go run ./cmd/unidb-bench latency      # native driver vs UniDB-Go latency
 go run ./cmd/unidb-bench throughput   # throughput and tail latency vs workers
 go run ./cmd/unidb-bench fedscale     # live federated join scaling
+go run ./cmd/unidb-bench latencyci    # latency with repeated independent runs and CIs
+go run ./cmd/unidb-bench throughputci # throughput with repeated runs and error rates
+go run ./cmd/unidb-bench mixed        # heterogeneous PostgreSQL/MySQL/federated workload
 ```
+
+`latencyci`, `throughputci` and `mixed` repeat the measurements in independent processes and report 95% confidence intervals. Further evaluation tools live in `cmd/eval-*`: an sqlmap attack harness with a deliberately vulnerable test application (`eval-sqlmap`), false positives on a benign corpus (`eval-benign`), router cross-validation (`eval-router`), join memory use and comparison with native and DuckDB joins (`eval-join`), and fault injection through a TCP proxy (`eval-fault`). The advanced-technique suite runs with `ADVANCED_JSON=out.json go test ./security -run TestAdvancedSuite`.
 
 Use `-pg` and `-my` to point at other servers. The security verification step uses a scratch MySQL database (`-secdb`, default `unidb_sec`) that the MySQL user must be allowed to create tables in.
 
@@ -129,9 +134,11 @@ docs/           design notes and demo guide
 ## Limitations
 
 - The parser is Vitess's MySQL 8.0 grammar. PostgreSQL placeholders, casts, `ILIKE`, quoted identifiers, dollar-quoted and `E''` strings are normalised before analysis (single-source queries are still sent exactly as written), but constructs such as `RETURNING` or `DISTINCT ON` are rejected unless `SecurityEngine.AllowUnparseable` is set.
-- Federated queries must not use backslashes in literals, double quotes or `#`, whose meaning differs between the two dialects; they are rejected with an explicit error.
-- Federated queries support inner equi-joins of two tables with single-table predicates; bind parameters, multi-way joins, grouping and ordering over the joined result are rejected with an explicit error. The build side of the join must fit in memory.
+- Federated queries must not use backslashes in literals, double quotes, `#` or `||`, whose meaning differs between the two dialects; they are rejected with an explicit error.
+- Federated queries support inner equi-joins of two tables with single-table predicates; bind parameters, multi-way joins, grouping and ordering over the joined result are rejected with an explicit error. Both inputs, the hash table and the output must fit in memory (there is no spilling), and transitive predicates are not derived.
 - MongoDB support covers single-collection `SELECT` with conjunctive predicates, `ORDER BY` and `LIMIT`/`OFFSET`, plus raw command documents; writes are not translated.
+- There are no distributed transactions: a write to two databases is two independent transactions, and federated reads share no snapshot.
+- The checker is defence in depth, not a replacement for bind parameters: it allows boolean probes such as `AND 2=11` by design and cannot see dynamic SQL built inside stored procedures.
 
 ## License
 

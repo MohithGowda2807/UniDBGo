@@ -1,6 +1,7 @@
 package federation
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"sort"
@@ -38,6 +39,14 @@ func (r Relation) index(col string) int {
 // produce false matches. NULL keys never match. Expected cost is O(n + m).
 // Output columns are l.Columns followed by r.Columns.
 func HashJoinRelations(l, r Relation, leftKey, rightKey string) (Relation, error) {
+	return hashJoinRelations(l, r, leftKey, rightKey, true)
+}
+
+// hashJoinRelations implements HashJoinRelations. When allowFast is true it
+// first attempts the int64-specialised fast path (fastHashJoin); the generic
+// NormalizeKey/FNV path is used when the fast path does not apply, or always
+// when allowFast is false (used by tests to force the generic path).
+func hashJoinRelations(l, r Relation, leftKey, rightKey string, allowFast bool) (Relation, error) {
 	li, ri := l.index(leftKey), r.index(rightKey)
 	if li < 0 || ri < 0 {
 		return Relation{}, fmt.Errorf("join key %s or %s not found", leftKey, rightKey)
@@ -47,6 +56,13 @@ func HashJoinRelations(l, r Relation, leftKey, rightKey string) (Relation, error
 	build, probe, bi, pi, buildIsLeft := l, r, li, ri, true
 	if len(r.Rows) < len(l.Rows) {
 		build, probe, bi, pi, buildIsLeft = r, l, ri, li, false
+	}
+	width := len(l.Columns) + len(r.Columns)
+
+	if allowFast {
+		if ok := fastHashJoin(&out, build, probe, bi, pi, buildIsLeft, width); ok {
+			return out, nil
+		}
 	}
 
 	type entry struct {
@@ -63,7 +79,6 @@ func HashJoinRelations(l, r Relation, leftKey, rightKey string) (Relation, error
 		table[h] = append(table[h], entry{k, row})
 	}
 
-	width := len(l.Columns) + len(r.Columns)
 	for _, p := range probe.Rows {
 		k, ok := NormalizeKey(p[pi])
 		if !ok {
@@ -83,6 +98,177 @@ func HashJoinRelations(l, r Relation, leftKey, rightKey string) (Relation, error
 		}
 	}
 	return out, nil
+}
+
+// fastHashJoin is a type-specialised join that avoids NormalizeKey's per-key
+// string allocation and FNV hashing when every non-NULL build key is an
+// integral value of NormalizeKey's "n:" class (Go integers, bool, integral
+// floats with |f| < 2^63, and []byte/string that trim to such an integer).
+// It builds a map[int64][]int of build-row indices and probes it with the
+// same conversion. It reports ok=false (leaving out untouched) when any
+// non-NULL build key is not integral, so the caller falls back to the generic
+// path. Semantics are identical to the generic path: a build key that is NULL
+// is skipped (NULL never matches); a probe key that is NULL or not an integral
+// int64 can never equal an integral build key under NormalizeKey, so it is
+// skipped. Rows are emitted in probe order, and within a probe row in build
+// insertion order, exactly as the generic path does.
+func fastHashJoin(out *Relation, build, probe Relation, bi, pi int, buildIsLeft bool, width int) (ok bool) {
+	table := make(map[int64][]int, len(build.Rows))
+	for idx, row := range build.Rows {
+		n, kind := intKey(row[bi])
+		switch kind {
+		case keyNull:
+			continue // NULL build key never matches
+		case keyOther:
+			return false // not integral: generic path required
+		}
+		table[n] = append(table[n], idx)
+	}
+	for _, p := range probe.Rows {
+		n, kind := intKey(p[pi])
+		if kind != keyInt {
+			continue // NULL or non-integral probe key cannot match an integral key
+		}
+		for _, bidx := range table[n] {
+			brow := build.Rows[bidx]
+			merged := make([]any, 0, width)
+			if buildIsLeft {
+				merged = append(append(merged, brow...), p...)
+			} else {
+				merged = append(append(merged, p...), brow...)
+			}
+			out.Rows = append(out.Rows, merged)
+		}
+	}
+	return true
+}
+
+// intKey classifies v exactly as NormalizeKey's "n:" branch does, without
+// allocating a key string for the common cases. keyNull mirrors NormalizeKey
+// returning ok=false (NULL). keyInt means v is an integral int64 "n:" key and
+// n is its value. keyOther means v is present but not an integral int64 key
+// (a non-integral number, a non-numeric string, a uint64/float outside int64's
+// range, a time, or any other type) and so has a non-"n:" NormalizeKey.
+func intKey(v any) (n int64, kind int) {
+	switch x := v.(type) {
+	case nil:
+		return 0, keyNull
+	case int:
+		return int64(x), keyInt
+	case int8:
+		return int64(x), keyInt
+	case int16:
+		return int64(x), keyInt
+	case int32:
+		return int64(x), keyInt
+	case int64:
+		return x, keyInt
+	case uint:
+		if uint64(x) > math.MaxInt64 {
+			return 0, keyOther // NormalizeKey formats it as a value no int64 key equals
+		}
+		return int64(x), keyInt
+	case uint8:
+		return int64(x), keyInt
+	case uint16:
+		return int64(x), keyInt
+	case uint32:
+		return int64(x), keyInt
+	case uint64:
+		if x > math.MaxInt64 {
+			return 0, keyOther
+		}
+		return int64(x), keyInt
+	case float32:
+		return floatIntKey(float64(x))
+	case float64:
+		return floatIntKey(x)
+	case bool:
+		if x {
+			return 1, keyInt
+		}
+		return 0, keyInt
+	case []byte:
+		return numericBytesIntKey(bytes.TrimSpace(x))
+	case string:
+		return numericBytesIntKey([]byte(strings.TrimSpace(x)))
+	}
+	return 0, keyOther
+}
+
+const (
+	keyNull  = iota // NULL: NormalizeKey ok=false
+	keyInt          // integral int64 "n:" key
+	keyOther        // present but not an integral int64 key
+)
+
+// floatIntKey mirrors normFloat: an integral float with |f| < 2^63 is an "n:"
+// key; anything else (fractional, NaN, Inf, or out of range) is not.
+func floatIntKey(f float64) (int64, int) {
+	if f == math.Trunc(f) && math.Abs(f) < 1<<63 {
+		return int64(f), keyInt
+	}
+	return 0, keyOther
+}
+
+// numericBytesIntKey mirrors normString for an already-trimmed byte slice: it
+// is an "n:" key when strconv.ParseInt(.,10,64) accepts it, or when it parses
+// as a finite integral float with |f| < 2^63 (ParseInt's fallback in
+// normString). b must already be whitespace-trimmed.
+func numericBytesIntKey(b []byte) (int64, int) {
+	if n, ok := parseInt64(b); ok {
+		return n, keyInt
+	}
+	// normString's fallback: SQL number syntax, ParseFloat, then normFloat.
+	if !sqlNumeric(string(b)) {
+		return 0, keyOther // a non-numeric "s:" key
+	}
+	f, err := strconv.ParseFloat(string(b), 64)
+	if err != nil || math.IsInf(f, 0) || math.IsNaN(f) {
+		return 0, keyOther // a non-numeric "s:" key
+	}
+	return floatIntKey(f)
+}
+
+// parseInt64 parses b as strconv.ParseInt(string(b), 10, 64) does, without
+// allocating. It reports ok=false on any input ParseInt would reject (empty,
+// a lone sign, a non-digit, or overflow), so the caller can apply the float
+// fallback for inputs such as "42.0" or "4e1" exactly as normString does.
+func parseInt64(b []byte) (int64, bool) {
+	if len(b) == 0 {
+		return 0, false
+	}
+	neg := false
+	i := 0
+	if b[0] == '+' || b[0] == '-' {
+		neg = b[0] == '-'
+		i = 1
+	}
+	if i == len(b) {
+		return 0, false // a lone sign
+	}
+	const cutoff = uint64(1) << 63
+	var u uint64
+	for ; i < len(b); i++ {
+		c := b[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		if u > (math.MaxUint64-uint64(c-'0'))/10 {
+			return 0, false // decimal overflow
+		}
+		u = u*10 + uint64(c-'0')
+	}
+	if neg {
+		if u > cutoff {
+			return 0, false // < math.MinInt64
+		}
+		return -int64(u), true
+	}
+	if u >= cutoff {
+		return 0, false // > math.MaxInt64
+	}
+	return int64(u), true
 }
 
 // NestedLoopRelations is the O(n * m) baseline: every pair of rows is
@@ -182,8 +368,10 @@ func fnv64a(s string) uint64 {
 // from different engines compare equal: lib/pq returns int64 while the MySQL
 // text protocol returns []byte("42"), and both must match. Integral numbers
 // (including integral floats and numeric strings) become "n:<int>", other
-// numbers "f:<float>", text "s:<text>" and times "t:<RFC3339 UTC>". NULL
-// yields ok=false.
+// numbers "f:<float>", text "s:<text>", times "t:<RFC3339 UTC>" and any other
+// type "o:<type>:<value>". NULL yields ok=false. Mixed numeric types compare
+// as MySQL compares them: integers exactly up to 64 bits, everything else as
+// float64.
 func NormalizeKey(v any) (key string, ok bool) {
 	switch x := v.(type) {
 	case nil:
@@ -224,7 +412,9 @@ func NormalizeKey(v any) (key string, ok bool) {
 	case time.Time:
 		return "t:" + x.UTC().Format(time.RFC3339Nano), true
 	}
-	return "", false
+	// Other driver types (UUID arrays, custom scanners, ...) join only with
+	// values of the same Go type and printed form, never across types.
+	return fmt.Sprintf("o:%T:%v", v, v), true
 }
 
 func normFloat(f float64) string {
@@ -236,6 +426,9 @@ func normFloat(f float64) string {
 
 func normString(s string) string {
 	t := strings.TrimSpace(s)
+	if !sqlNumeric(t) {
+		return "s:" + s
+	}
 	if i, err := strconv.ParseInt(t, 10, 64); err == nil {
 		return "n:" + strconv.FormatInt(i, 10)
 	}
@@ -243,6 +436,46 @@ func normString(s string) string {
 		return normFloat(f)
 	}
 	return "s:" + s
+}
+
+// sqlNumeric reports whether t is a number in SQL literal syntax: optional
+// sign, digits with an optional fraction, and an optional exponent. Go-only
+// forms such as "1_000", "0x1Ap0", "Inf" or "NaN" stay text.
+func sqlNumeric(t string) bool {
+	i, n := 0, len(t)
+	if i < n && (t[i] == '+' || t[i] == '-') {
+		i++
+	}
+	digits := 0
+	for i < n && t[i] >= '0' && t[i] <= '9' {
+		i++
+		digits++
+	}
+	if i < n && t[i] == '.' {
+		i++
+		for i < n && t[i] >= '0' && t[i] <= '9' {
+			i++
+			digits++
+		}
+	}
+	if digits == 0 {
+		return false
+	}
+	if i < n && (t[i] == 'e' || t[i] == 'E') {
+		i++
+		if i < n && (t[i] == '+' || t[i] == '-') {
+			i++
+		}
+		exp := 0
+		for i < n && t[i] >= '0' && t[i] <= '9' {
+			i++
+			exp++
+		}
+		if exp == 0 {
+			return false
+		}
+	}
+	return i == n
 }
 
 func toInt64(v any) (int64, bool) {

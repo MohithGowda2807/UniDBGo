@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 
 	"github.com/Dheeran-git/UniDBGo/internal"
 	"github.com/Dheeran-git/UniDBGo/parser"
@@ -41,38 +40,42 @@ func (f *FederationEngine) Execute(ctx context.Context, plan *planner.ExecutionP
 	if len(plan.Steps) == 0 {
 		return nil, fmt.Errorf("empty execution plan")
 	}
+	// The caller's deadline bounds the whole query, even if a driver does not
+	// return when its context ends (lib/pq can block on an unresponsive
+	// server): the first error, or the end of the caller's context, returns at
+	// once and cancels the remaining scans, whose results are discarded.
+	parent := ctx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var (
-		wg       sync.WaitGroup
-		mu       sync.Mutex
-		firstErr error
-		results  = make(map[int]Relation)
-	)
+	type scanResult struct {
+		id  int
+		rel Relation
+		err error
+	}
+	var scans int
+	done := make(chan scanResult, len(plan.Steps)) // buffered: late scans never block
 	for _, step := range plan.Steps {
 		if step.Type != "SCAN" {
 			continue
 		}
-		wg.Add(1)
+		scans++
 		go func(s planner.ExecutionStep) {
-			defer wg.Done()
 			rel, err := f.executeStep(ctx, s)
-			mu.Lock()
-			defer mu.Unlock()
-			if err != nil {
-				if firstErr == nil {
-					firstErr = err
-					cancel() // abort the sibling extraction
-				}
-				return
-			}
-			results[s.ID] = rel
+			done <- scanResult{s.ID, rel, err}
 		}(step)
 	}
-	wg.Wait()
-	if firstErr != nil {
-		return nil, firstErr
+	results := make(map[int]Relation, len(plan.Steps))
+	for i := 0; i < scans; i++ {
+		select {
+		case r := <-done:
+			if r.err != nil {
+				return nil, r.err // the deferred cancel aborts the sibling extraction
+			}
+			results[r.id] = r.rel
+		case <-parent.Done():
+			return nil, fmt.Errorf("federation: %w", parent.Err())
+		}
 	}
 
 	for _, step := range plan.Steps {

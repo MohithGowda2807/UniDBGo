@@ -53,7 +53,23 @@ func parseInsert(ins *sqlparser.Insert) (*QueryAST, error) {
 	for _, col := range ins.Columns {
 		ast.Fields = append(ast.Fields, FieldNode{Name: col.String()})
 	}
+	addReferencedTables(ins, ast)
 	return ast, nil
+}
+
+// addReferencedTables adds every table a write statement reads, for example
+// through INSERT ... SELECT or a sub-query, after its target table. Without
+// them a write that reads another database would look single-source and be
+// sent whole to the target's backend.
+func addReferencedTables(stmt sqlparser.SQLNode, ast *QueryAST) {
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		if t, ok := node.(*sqlparser.AliasedTableExpr); ok {
+			if name, ok := t.Expr.(sqlparser.TableName); ok && !(name.Qualifier.IsEmpty() && name.Name.String() == "dual") {
+				addTableName(name, t.As.String(), ast)
+			}
+		}
+		return true, nil
+	}, stmt)
 }
 
 func parseUpdate(upd *sqlparser.Update) (*QueryAST, error) {
@@ -68,6 +84,7 @@ func parseUpdate(upd *sqlparser.Update) (*QueryAST, error) {
 		extractConditions(upd.Where.Expr, ast)
 	}
 	ast.Limit = limitOf(upd.Limit)
+	addReferencedTables(upd, ast)
 	return ast, nil
 }
 
@@ -80,5 +97,6 @@ func parseDelete(del *sqlparser.Delete) (*QueryAST, error) {
 		extractConditions(del.Where.Expr, ast)
 	}
 	ast.Limit = limitOf(del.Limit)
+	addReferencedTables(del, ast)
 	return ast, nil
 }

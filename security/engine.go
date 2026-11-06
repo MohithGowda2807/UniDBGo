@@ -27,6 +27,7 @@ const (
 	CatCommentTruncation Category = "comment-truncation" // V4
 	CatTimingFunction    Category = "dangerous-function" // V5
 	CatInference         Category = "inference"          // V5
+	CatErrorEcho         Category = "error-echo"         // V5
 	CatSystemCatalog     Category = "system-catalog"
 	CatUnparseable       Category = "unparseable"
 	CatAnomaly           Category = "anomaly"
@@ -118,6 +119,26 @@ var dangerousFunctions = map[string]bool{
 	"lo_import": true, "lo_export": true, "dblink": true, "dblink_exec": true,
 	"receive_message": true, // dbms_pipe.receive_message
 }
+
+// errorEchoFunctions are functions whose error messages echo (a prefix of)
+// their argument back to the client, so an attacker can exfiltrate data by
+// forcing a deliberately malformed argument built from the value they want to
+// read (V5, error-based side channels). They are matched by their dedicated
+// AST node types rather than by name; this comment is the documented set:
+//
+//	EXTRACTVALUE(frag, xpath)        -- "XPATH syntax error: '<data>'"
+//	UPDATEXML(target, xpath, new)    -- "XPATH syntax error: '<data>'"
+//	GTID_SUBSET(set, n) / GTID_SUBTRACT(set, set)
+//	                                 -- "Malformed GTID set specification '<data>'"
+//	ST_LATFROMGEOHASH / ST_LONGFROMGEOHASH / ST_POINTFROMGEOHASH(hash[, srid])
+//	                                 -- the geohash argument is echoed on error
+//	JSON_KEYS(doc[, path])           -- "Invalid JSON text ... '<data>'"
+//
+// These are the error-based vectors sqlmap uses against MySQL. A call is
+// rejected only when one of its arguments (at any depth) carries an
+// exfiltration source: a sub-query, a system-information function, or an @@
+// system variable. Passing columns or literals (the legitimate use) is
+// allowed. See isErrorEcho and exfilSource.
 
 // systemInfoFunctions disclose server metadata. Compared against constants
 // they are the hallmark of inference (blind) attacks, which test their value
@@ -213,7 +234,7 @@ func (e *SecurityEngine) analyze(query string, ast *parser.QueryAST, parseErr er
 		if parseErr == nil || errors.Is(parseErr, parser.ErrInvalidQuery) || errors.Is(parseErr, parser.ErrUnsupportedQuery) {
 			// The grammar accepted the text but the summary did not; inspect the raw tree.
 			if stmts, err := parser.StatementsFor(query, d); err == nil && len(stmts) == 1 {
-				return e.finish(query, e.inspect(stmts[0]))
+				return e.finish(query, e.inspect(stmts[0], d))
 			}
 		}
 		if e.AllowUnparseable {
@@ -222,7 +243,7 @@ func (e *SecurityEngine) analyze(query string, ast *parser.QueryAST, parseErr er
 		return block(CatUnparseable, "Query rejected: %v", parseErr)
 	}
 
-	return e.finish(query, e.inspect(ast.Stmt))
+	return e.finish(query, e.inspect(ast.Stmt, d))
 }
 
 func (e *SecurityEngine) finish(query string, d Decision) Decision {
@@ -244,7 +265,34 @@ type errStop struct{ d Decision }
 
 func (errStop) Error() string { return "stop" }
 
-func (e *SecurityEngine) inspect(stmt sqlparser.Statement) Decision {
+func (e *SecurityEngine) inspect(stmt sqlparser.Statement, d parser.Dialect) Decision {
+	if _, ok := stmt.(*sqlparser.OtherAdmin); ok {
+		// The parser keeps no tree for these statements (DO SLEEP(5),
+		// OPTIMIZE TABLE ...), so they cannot be inspected: treat them like
+		// unparseable text.
+		if e.AllowUnparseable {
+			return flag(CatUnparseable, "Statement not inspected: the parser keeps no syntax tree for it")
+		}
+		return block(CatUnparseable, "Statement rejected: the parser keeps no syntax tree for it")
+	}
+	if p, ok := stmt.(*sqlparser.PrepareStmt); ok {
+		// PREPARE s FROM '<sql>': the prepared text is SQL that EXECUTE will
+		// run later, so it is inspected like a statement of its own. A
+		// statement prepared from a variable cannot be seen here.
+		if lit, ok := p.Statement.(*sqlparser.Literal); ok && lit.Type == sqlparser.StrVal {
+			stmts, err := parser.StatementsFor(lit.Val, parser.MySQL)
+			switch {
+			case errors.Is(err, parser.ErrMultiStatement) || len(stmts) > 1:
+				return block(CatPiggyback, "Piggy-backed query inside PREPARE")
+			case err != nil || len(stmts) == 0:
+				if e.AllowUnparseable {
+					return flag(CatUnparseable, "Prepared statement could not be parsed: %v", err)
+				}
+				return block(CatUnparseable, "Prepared statement rejected: %v", err)
+			}
+			return e.inspect(stmts[0], parser.MySQL)
+		}
+	}
 	var flagged Decision
 	_, topUnion := stmt.(*sqlparser.Union)
 
@@ -252,18 +300,32 @@ func (e *SecurityEngine) inspect(stmt sqlparser.Statement) Decision {
 		switch n := node.(type) {
 		case *sqlparser.OrExpr:
 			for _, branch := range disjuncts(n) {
-				if isTautology(branch) {
+				if isTautology(branch, d) {
 					return false, errStop{block(CatTautology,
 						"Tautology: disjunct %q is always true", sqlparser.String(branch))}
+				}
+				if rowIndependent(branch, d) {
+					return false, errStop{block(CatTautology,
+						"Tautology: disjunct %q does not depend on any row or parameter", sqlparser.String(branch))}
 				}
 			}
 		case *sqlparser.FuncExpr:
 			if name := n.Name.Lowered(); dangerousFunctions[name] {
 				return false, errStop{block(CatTimingFunction, "Dangerous function call: %s()", name)}
 			}
+		case *sqlparser.SelectInto:
+			if n.Type == sqlparser.IntoOutfile || n.Type == sqlparser.IntoOutfileS3 || n.Type == sqlparser.IntoDumpfile {
+				return false, errStop{block(CatTimingFunction, "File write: SELECT ... INTO OUTFILE/DUMPFILE")}
+			}
 		case *sqlparser.LockingFunc:
 			if n.Type == sqlparser.GetLock {
 				return false, errStop{block(CatTimingFunction, "Dangerous function call: get_lock()")}
+			}
+		case *sqlparser.ExtractValueExpr, *sqlparser.UpdateXMLExpr, *sqlparser.GTIDFuncExpr,
+			*sqlparser.GeomFromGeoHashExpr, *sqlparser.JSONKeysExpr:
+			if src := exfilSource(n); src != "" {
+				return false, errStop{block(CatErrorEcho,
+					"Error-based side channel: %s receives %s", errorEchoName(n), src)}
 			}
 		case *sqlparser.Union:
 			for _, branch := range unionBranches(n) {
@@ -324,10 +386,25 @@ func (e *SecurityEngine) inferenceProbe(cmp sqlparser.Expr) Decision {
 			}
 		case *sqlparser.ColName:
 			column = true
+		case sqlparser.AggrFunc:
+			// COUNT(*) and other aggregates depend on the outer rows even
+			// without a column reference (HAVING count(*) > (SELECT ...)).
+			column = true
 		case *sqlparser.Subquery:
 			for _, t := range allTables(n) {
 				if e.restricted(t.Name.String()) && probe == "" {
 					probe = "a sub-query over " + t.Name.String()
+				}
+			}
+			// A scalar sub-query that *selects* server metadata is itself an
+			// inference primitive, e.g. (SELECT version())::int = 1 (the
+			// PostgreSQL postfix cast is dropped during normalization, leaving
+			// the bare comparison). Only the projection is inspected: metadata
+			// used to *filter* a sub-query (WHERE created_by = CURRENT_USER())
+			// is legitimate.
+			if probe == "" {
+				if meta := selectsMetadata(n.Select); meta != "" {
+					probe = "a sub-query selecting " + meta
 				}
 			}
 			return false, nil // its own columns are not outer columns
@@ -340,10 +417,107 @@ func (e *SecurityEngine) inferenceProbe(cmp sqlparser.Expr) Decision {
 	return Decision{}
 }
 
+// errorEchoName gives a readable name for an error-echoing function node, for
+// use in a block reason.
+func errorEchoName(node sqlparser.SQLNode) string {
+	switch n := node.(type) {
+	case *sqlparser.ExtractValueExpr:
+		return "extractvalue()"
+	case *sqlparser.UpdateXMLExpr:
+		return "updatexml()"
+	case *sqlparser.GTIDFuncExpr:
+		if n.Type == sqlparser.GTIDSubtractType {
+			return "gtid_subtract()"
+		}
+		return "gtid_subset()"
+	case *sqlparser.GeomFromGeoHashExpr:
+		switch n.GeomType {
+		case sqlparser.LongitudeFromHash:
+			return "st_longfromgeohash()"
+		case sqlparser.PointFromHash:
+			return "st_pointfromgeohash()"
+		default:
+			return "st_latfromgeohash()"
+		}
+	case *sqlparser.JSONKeysExpr:
+		return "json_keys()"
+	}
+	return "an error-echoing function"
+}
+
+// exfilSource reports the first exfiltration source found anywhere among the
+// arguments of node (a sub-query, a system-information function, or an @@
+// system variable), or "" if the arguments carry only columns, literals and
+// ordinary expressions. node is an error-echoing function node, and its
+// children are exactly its arguments.
+func exfilSource(node sqlparser.SQLNode) string {
+	var found string
+	_ = sqlparser.Walk(func(inner sqlparser.SQLNode) (bool, error) {
+		if inner == node {
+			return true, nil // descend into the arguments, but do not match the node itself
+		}
+		switch x := inner.(type) {
+		case *sqlparser.Subquery:
+			found = "a sub-query"
+			return false, errStop{}
+		case *sqlparser.FuncExpr:
+			if systemInfoFunctions[x.Name.Lowered()] {
+				found = x.Name.Lowered() + "()"
+				return false, errStop{}
+			}
+		case *sqlparser.Variable:
+			found = "@@" + x.Name.String()
+			return false, errStop{}
+		}
+		return true, nil
+	}, node)
+	return found
+}
+
+// selectsMetadata reports the first server-metadata source (a
+// systemInfoFunction or @@ variable) that appears in the projection list of
+// sel or any of its UNION branches, or "" if none. Only the selected
+// expressions are inspected, not FROM/WHERE/GROUP BY, so metadata used to
+// filter a sub-query is not treated as exfiltration.
+func selectsMetadata(sel sqlparser.TableStatement) string {
+	for _, branch := range unionBranches(sel) {
+		for _, se := range branch.SelectExprs.Exprs {
+			ae, ok := se.(*sqlparser.AliasedExpr)
+			if !ok {
+				continue
+			}
+			var meta string
+			_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+				switch x := node.(type) {
+				case *sqlparser.FuncExpr:
+					if systemInfoFunctions[x.Name.Lowered()] {
+						meta = x.Name.Lowered() + "()"
+						return false, errStop{}
+					}
+				case *sqlparser.Variable:
+					meta = "@@" + x.Name.String()
+					return false, errStop{}
+				}
+				return true, nil
+			}, ae.Expr)
+			if meta != "" {
+				return meta
+			}
+		}
+	}
+	return ""
+}
+
 // checkUnionBranch blocks UNION branches that read restricted tables or
 // system catalogs (anywhere in the branch, including sub-queries), that
 // select server metadata, or, for a top-level UNION, that select only
 // constants (column-count probing).
+//
+// The operands of INTERSECT and EXCEPT reach here as UNION branches too: the
+// parser represents such a query as a chain of UNIONs (parser.QueryAST.SetOps
+// names the real operators). The rules apply to them unchanged. A branch can
+// leak data through INTERSECT or EXCEPT as well, by whether rows survive, and
+// a constant-only branch probes the column count exactly as with UNION.
 func (e *SecurityEngine) checkUnionBranch(sel *sqlparser.Select, topLevel bool) Decision {
 	for _, t := range allTables(sel) {
 		if isCatalog(t) || e.restricted(t.Name.String()) {
@@ -398,8 +572,8 @@ func isCatalog(t sqlparser.TableName) bool {
 
 // isTautology reports whether a disjunct is always true: either its static
 // value is true, or it compares an expression with itself.
-func isTautology(e sqlparser.Expr) bool {
-	if v, ok := eval(e); ok {
+func isTautology(e sqlparser.Expr, d parser.Dialect) bool {
+	if v, ok := evalFor(e, d); ok {
 		return v.truthy()
 	}
 	if c, ok := e.(*sqlparser.ComparisonExpr); ok {
@@ -410,6 +584,70 @@ func isTautology(e sqlparser.Expr) bool {
 		}
 	}
 	return false
+}
+
+// rowIndependent reports whether e is a constant the static evaluator could
+// not decide: it references no column (not even inside a sub-query), bind
+// parameter, variable or aggregate, so its value is the same for every row
+// and every request, as in (SELECT 1)=1, EXISTS(SELECT 1) or UNHEX('41')='A'.
+// Such a disjunct either never or always matches; written into an OR it is a
+// tautology the evaluator cannot prove, and legitimate queries have no use
+// for it. Disjuncts the evaluator can decide (OR 1=0) are left to eval.
+func rowIndependent(e sqlparser.Expr, d parser.Dialect) bool {
+	if _, ok := evalFor(e, d); ok {
+		return false
+	}
+	independent := true
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		switch node.(type) {
+		case *sqlparser.ColName, *sqlparser.Argument, *sqlparser.Variable, sqlparser.AggrFunc,
+			*sqlparser.ValuesFuncExpr, *sqlparser.Default:
+			independent = false
+			return false, errStop{}
+		}
+		return true, nil
+	}, e)
+	return independent
+}
+
+// evalFor evaluates e statically for dialect d. The evaluator implements
+// MySQL semantics; PostgreSQL gives some operators other meanings (integer
+// division for '/', power for '^', concatenation for '||', which the analysis
+// reads as '+', and case-sensitive string comparison), so for PostgreSQL an
+// expression using them is left undecided and falls to the row-independence
+// rule instead.
+func evalFor(e sqlparser.Expr, d parser.Dialect) (value, bool) {
+	if d == parser.Postgres && usesDivergentOperator(e) {
+		return value{}, false
+	}
+	return eval(e)
+}
+
+func usesDivergentOperator(e sqlparser.Expr) bool {
+	found := false
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		switch b := node.(type) {
+		case *sqlparser.BinaryExpr:
+			switch b.Operator {
+			case sqlparser.PlusOp, sqlparser.DivOp, sqlparser.IntDivOp, sqlparser.ModOp, sqlparser.BitXorOp:
+				found = true
+				return false, errStop{}
+			}
+		case *sqlparser.ComparisonExpr:
+			// PostgreSQL compares strings case-sensitively and by collation
+			// order; MySQL's case-insensitive result does not carry over.
+			if l, ok := eval(b.Left); ok && l.kind == 's' {
+				found = true
+				return false, errStop{}
+			}
+			if r, ok := eval(b.Right); ok && r.kind == 's' {
+				found = true
+				return false, errStop{}
+			}
+		}
+		return true, nil
+	}, e)
+	return found
 }
 
 // disjuncts flattens nested OR expressions (the parser drops parentheses).
@@ -474,7 +712,8 @@ func allTables(node sqlparser.SQLNode) []sqlparser.TableName {
 // query ("admin'-- "). It blocks when the comment ends the input and its
 // text continues the statement as SQL: a boolean connective followed by a
 // comparison (AND password = ...), ORDER BY / GROUP BY, LIMIT n, or UNION
-// SELECT. Prose such as "-- don't remove" or "-- from 2024" is allowed.
+// SELECT (or INTERSECT / EXCEPT SELECT). Prose such as "-- don't remove" or
+// "-- from 2024" is allowed.
 func checkTrailingComment(query string, d parser.Dialect) Decision {
 	if !strings.ContainsAny(query, "#-/") {
 		return Decision{} // no comment opener at all
@@ -516,8 +755,26 @@ func checkTrailingComment(query string, d parser.Dialect) Decision {
 // would contribute to the statement had it not been commented out.
 func sqlContinuation(body string) string {
 	body = strings.TrimSpace(body)
-	body = strings.TrimPrefix(body, "'") // the rest of a literal the payload closed
-	body = strings.TrimPrefix(body, `"`)
+	if c := continuationTokens(body); c != "" {
+		return c
+	}
+	// The payload may have closed a literal anywhere in the comment, as in
+	// admin'--'' AND password = '...': try the text after each of the first
+	// few quotes as well.
+	for i, tries := 0, 0; i < len(body) && tries < 8; i++ {
+		if body[i] == '\'' || body[i] == '"' {
+			tries++
+			if c := continuationTokens(body[i+1:]); c != "" {
+				return c
+			}
+		}
+	}
+	return ""
+}
+
+// continuationTokens reports SQL that body would add to the statement if it
+// were not commented out ("" if none).
+func continuationTokens(body string) string {
 	tkn := parser.NewTokenizer(body)
 	var toks []string
 	for len(toks) < 64 {
@@ -530,6 +787,8 @@ func sqlContinuation(body string) string {
 			toks = append(toks, "<STR>")
 		case typ == sqlparser.INTEGRAL:
 			toks = append(toks, "<NUM>")
+		case typ == sqlparser.ID && (strings.EqualFold(val, "INTERSECT") || strings.EqualFold(val, "EXCEPT")):
+			toks = append(toks, strings.ToUpper(val)) // set operators Vitess reads as identifiers
 		case typ == sqlparser.ID:
 			toks = append(toks, "<ID>")
 		case typ == sqlparser.LE, typ == sqlparser.GE, typ == sqlparser.NE, typ == sqlparser.NULL_SAFE_EQUAL:
@@ -557,10 +816,10 @@ func sqlContinuation(body string) string {
 			if i+1 < len(toks) && toks[i+1] == "<NUM>" {
 				return "LIMIT"
 			}
-		case "UNION":
+		case "UNION", "INTERSECT", "EXCEPT":
 			for _, u := range toks[i+1 : min(len(toks), i+3)] {
 				if u == "SELECT" {
-					return "UNION SELECT"
+					return t + " SELECT"
 				}
 			}
 		}

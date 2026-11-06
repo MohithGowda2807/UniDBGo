@@ -3,6 +3,11 @@
 ## Unreleased
 
 ### Security
+- A statement routed to a backend whose lexical rules differ from those used for the check is re-parsed and re-checked with the backend's rules before it runs.
+- Every MySQL versioned comment `/*!NNNNN ... */` is read as code (the parser no longer skips bodies a newer server executes); PostgreSQL `||` is read as concatenation.
+- New rules: undecidable constant `OR` operands (`OR EXISTS(SELECT 1)`), error-based exfiltration through `EXTRACTVALUE`/`UPDATEXML`/`GTID_SUBSET`/`ST_*FromGeoHash`/`JSON_KEYS`, sub-queries selecting server metadata, `SELECT ... INTO OUTFILE/DUMPFILE`; the SQL text of `PREPARE` is inspected; statements the parser keeps no tree for (`DO ...`) are rejected unless fail-open.
+- JSON command documents are checked for server-side JavaScript (`$where`, `$function`, `$accumulator`, `mapReduce`) and run only on MongoDB sources.
+- Writes whose source or sub-query names another database are rejected instead of being sent to one backend.
 - Queries are read with the lexical rules of their target database: PostgreSQL strings, where a backslash does not escape a quote, can no longer smuggle tautologies or stacked statements past the checker. `"identifiers"`, dollar-quoted strings and `#` are handled the PostgreSQL way.
 - Single-source queries are sent as written, with only the backend qualifier removed; they are never re-rendered with MySQL escaping. Federated scans quote identifiers and pass every literal as a bind parameter.
 - The checker blocks schema-qualified and additional dangerous functions (`pg_sleep_for`, `pg_read_binary_file`, `get_lock`, ...), PostgreSQL `pg_*` catalogs, extraction through sub-queries inside UNION branches, metadata probes outside `WHERE`, and tautologies hidden in `CASE`, `COALESCE`, `IF` or `CAST`.
@@ -11,7 +16,11 @@
 - Dashboard: output is HTML-escaped (stored XSS through result rows), request bodies are size-limited, and responses carry security headers.
 
 ### Added
-- Security decisions are cached per dialect and query text (call `SecurityEngine.ResetCache` after changing its configuration); a cached parameterised query costs about 1 µs of pipeline CPU.
+- `INTERSECT` and `EXCEPT` are parsed and inspected (the Vitess grammar lacks them).
+- `Query`/`Exec` return at the caller's deadline even when a driver ignores it; federated queries return on the first scan error or at the deadline.
+- Integer fast path in the hash join (no key strings allocated).
+- Evaluation tools: `cmd/eval-sqlmap`, `cmd/eval-benign`, `cmd/eval-router`, `cmd/eval-join`, `cmd/eval-fault`, the advanced-technique suite (`security/advanced_suite_test.go`), and `unidb-bench latencyci`, `throughputci` and `mixed`.
+- Security decisions are cached per dialect and query text (call `SecurityEngine.ResetCache` after changing its configuration); a cached parameterised query costs about 1–2 µs of pipeline CPU.
 - `engine` package: the end-to-end pipeline with stage timings.
 - Portable errors (`api.ErrUniqueViolation`, `ErrForeignKeyViolation`, `ErrNotNullViolation`, `ErrDeadlock`).
 - Transaction options (isolation level, read-only); connection URI parameters such as `sslmode` or `parseTime`; `postgresql://` scheme.
@@ -21,6 +30,8 @@
 - `cmd/unidb-bench` and the evaluation corpora; CI with PostgreSQL and MySQL service containers.
 
 ### Fixed
+- Join keys of types without a canonical form joined nothing; they now join by Go type and value.
+- `HAVING count(*) > (SELECT ...)` over a restricted table is no longer mistaken for an inference probe.
 - Errors raised while reading rows are reported (`Result.Err`) instead of silently truncating results.
 - Federated joins: case-insensitive column matching, `AS` aliases, NULL keys, mixed driver key types.
 - MongoDB: `LIMIT 0`, placeholder numbering, SQL NULL semantics for `<>`/`NOT IN`, `LIKE` escapes.
