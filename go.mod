@@ -7,7 +7,7 @@ toolchain go1.27.3
 require (
 	github.com/go-sql-driver/mysql v1.10.1
 	github.com/lib/pq v1.12.3
-	go.mongodb.org/mongo-driver/v2 v2.9.2
+	go.mongodb.org/mongo-driver/v2 v2.9.3
 	vitess.io/vitess v0.24.5
 )
 
